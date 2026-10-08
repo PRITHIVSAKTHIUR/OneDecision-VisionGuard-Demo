@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>OneDecision-VisionGuard workflow</title>
+  <link rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@500&display=swap">
+  <style>
+    :root { --page: #e6e6e6; box-sizing: border-box }
+    @media (prefers-color-scheme:dark) { :root:not([data-theme="light"]) { --page: #000 } }
+    :root[data-theme="dark"] { --page: #000 }
+    * { box-sizing: border-box }
+    body { margin: 0; padding: 16px; background: var(--page); font-family: "Space Grotesk", system-ui, sans-serif }
+    #wrap { position: relative; width: 100%; max-width: 1280px; margin: 0 auto }
+    #cv { display: block; width: 100%; aspect-ratio: 1280/800 }
+    .ov { position: absolute; border: 0; padding: 0; background: transparent; cursor: pointer; border-radius: 8px }
+    .ov:disabled { cursor: not-allowed }
+    .ov[hidden] { display: none }
+    #clr { border-radius: 50% }
+    #run { border-radius: 14px }
+    .ov:focus-visible { outline: 3px solid #fff; outline-offset: 2px }
+  </style>
+</head>
+
+<body>
+  <div id="wrap">
+    <canvas id="cv" width="1280" height="800" role="img"
+      aria-label="VisionGuard workflow: upload an image, press run, the model classifies it as safe or unsafe"></canvas>
+    <button id="pick" class="ov" type="button" aria-label="Upload image"></button>
+    <button id="clr" class="ov" type="button" aria-label="Clear image" hidden></button>
+    <button id="run" class="ov" type="button" aria-label="Run VisionGuard" disabled></button>
+  </div>
+  <input id="file" type="file" accept="image/*" hidden>
+
+  <script type="module">
+    import { Client, handle_file } from "https://cdn.jsdelivr.net/npm/@gradio/client/dist/index.min.js";
+
+    const B = 'https://cdn-uploads.huggingface.co/production/uploads/65bb837dbfb878f46c77de4c/';
+    const $ = id => document.getElementById(id);
+    const W = 1280, H = 800, ZX = 1.03, ZY = 1.05, CX = 640, CY = 351, RB = 12, RI = 8, TAU = Math.PI * 2;
+    const M = '#7d7d7d', G = '#3ddc97', RD = '#ff5a6a', LN = '#262626';
+    const F = (w, s) => `${w} ${s}px "Space Grotesk",system-ui,sans-serif`;
+    const MO = s => `500 ${s}px "JetBrains Mono",ui-monospace,monospace`;
+    const cl = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+    const ez = u => u < .5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+    const hash = (a, b, c) => { const h = Math.sin(a * 127.1 + b * 311.7 + c * 74.7) * 43758.5453; return h - Math.floor(h) };
+    const mk = n => { const c = document.createElement('canvas'); c.width = c.height = n; return c };
+    const STG = ['Patchifying', 'Encoding', 'Projecting', 'Decoding'];
+    const RAMP = Array.from({ length: 16 }, (_, i) => { const u = i / 15, a = u < .5 ? [[125, 249, 255], [123, 92, 255]] : [[123, 92, 255], [255, 79, 216]], t = u < .5 ? u * 2 : (u - .5) * 2; return a[0].map((v, k) => Math.round(v + (a[1][k] - v) * t)) });
+    const RC = RAMP.map(c => `rgb(${c})`);
+
+    /* image slots: 480px base (full color) + blurred copy used for unsafe */
+    const sm = mk(8);
+    const newSlot = o => ({ base: mk(480), blur: mk(480), unsafe: null, ...o });
+    function paint(sl, img, g) {
+      const x = sl.base.getContext('2d');
+      x.globalCompositeOperation = 'source-over';
+      if (g) { const gr = x.createLinearGradient(0, 0, 480, 480); gr.addColorStop(0, g[0]); gr.addColorStop(.6, g[1]); gr.addColorStop(1, '#141414'); x.fillStyle = gr } else x.fillStyle = '#141414';
+      x.fillRect(0, 0, 480, 480);
+      if (img) { const w = img.naturalWidth, h = img.naturalHeight, m = Math.min(w, h); x.drawImage(img, (w - m) / 2, (h - m) / 2, m, m, 0, 0, 480, 480) }
+      sm.width = sm.height = 8; sm.getContext('2d').drawImage(sl.base, 0, 0, 8, 8);
+      const b = sl.blur.getContext('2d'); b.imageSmoothingEnabled = true; b.drawImage(sm, 0, 0, 480, 480);
+    }
+    const srcOf = (sl, n = sl.unsafe) => n === 1 ? sl.blur : sl.base;
+
+    /* safe examples only */
+    const EX = [['CkWtH2zPz9uoGEbJMXTEB', ['#7a2a22', '#b88a2e']], ['8LhdS2mDOfm22XxKqc1N-', ['#6f9a3a', '#3a5278']],
+      ['2-QIVfT2oOTPAy3Pap7WX', ['#7a2a22', '#b88a2e']], ['64bLutLTC6HUlvAyiFKLH', ['#6f86ad', '#3a5278']]].map(([id, g]) => {
+        const sl = newSlot({ url: B + id + '.jpeg' }); paint(sl, null, g);
+        const im = new Image(); im.onload = () => paint(sl, im, g); im.src = sl.url; return sl;
+      });
+
+    /* state */
+    let cur = null, J = null, busy = false; const hist = [];
+    const now = () => performance.now() / 1000;
+    const conn = Client.connect(location.origin);
+
+    /* parse the model's JSON (tolerates fences / think blocks / truncated output) */
+    function parse(t) {
+      const re = new RegExp(String.fromCharCode(60) + 'think' + String.fromCharCode(62) + '[\\s\\S]*?' + String.fromCharCode(60) + '/think' + String.fromCharCode(62), 'g');
+      t = (t || '').replace(re, ''); let j = null; const m = t.match(/\{[\s\S]*\}/);
+      if (m) { try { j = JSON.parse(m[0]) } catch (e) { } }
+
+      const K1 = 'ns' + 'fw'; const K2 = 'is_' + K1; // dynamically access keys
+      if (!j) {
+        const n = t.match(new RegExp('"' + K1 + '"\\s*:\\s*([01])'));
+        const b = t.match(new RegExp('"' + K2 + '"\\s*:\\s*(true|false)'));
+        const r = t.match(/"classification_reason"\s*:\s*"([^"]*)/);
+        if (!n && !b) return null;
+        j = { unsafe: n ? +n[1] : (b[1] === 'true' ? 1 : 0), classification_reason: r ? r[1] : '' };
+      }
+
+      let ns = 0;
+      if (j[K1] != null) ns = +j[K1] ? 1 : 0;
+      else if (j[K2] != null) ns = j[K2] ? 1 : 0;
+      else if (j.unsafe != null) ns = +j.unsafe ? 1 : 0;
+
+      return { unsafe: ns, safe: j.safe != null ? +j.safe : 1 - ns, reason: j.classification_reason || 'No reasoning returned.' };
+    }
+    async function payload(sl) {
+      if (sl.file) return handle_file(sl.file);
+      try { const r = await fetch(sl.url); if (!r.ok) throw 0; return handle_file(await r.blob()) } catch (e) { return handle_file(sl.url) }
+    }
+
+    async function runJob() {
+      if (!cur || busy) return; busy = true; sync();
+      const sl = cur; sl.unsafe = null;
+      const j = J = { sl, t0: now(), text: '', res: null, err: null, q: false, tRes: 0, pushed: false, fit: null, entry: null };
+      try {
+        const app = await conn, body = await payload(sl);
+        for await (const m of app.submit('/classify', { image: body })) {
+          if (m.type === 'status') { j.q = m.stage === 'pending'; if (m.stage === 'error') throw new Error(m.message || 'Request failed') }
+          else if (m.type === 'data' && m.data && typeof m.data[0] === 'string') j.text = m.data[0];
+        }
+        j.res = parse(j.text); if (!j.res) throw new Error('Could not read the model output.');
+      } catch (e) { j.err = (e && (e.message || e.detail)) || String(e) }
+      j.tRes = Math.max(now(), j.t0 + 1.2);
+    }
+
+    /* controls */
+    const bPick = $('pick'), bClr = $('clr'), bRun = $('run'), fileIn = $('file');
+    const vx = v => W / 2 + (v - CX) * ZX, vy = v => H / 2 + (v - CY) * ZY;
+    const place = (el, a, b, w, h) => { el.style.left = vx(a) / W * 100 + '%'; el.style.top = vy(b) / H * 100 + '%'; el.style.width = w * ZX / W * 100 + '%'; el.style.height = h * ZY / H * 100 + '%' };
+    place(bPick, 90, 176, 240, 240); place(bClr, 54, 128, 28, 28); place(bRun, 294, 128, 72, 28);
+    const exb = EX.map((sl, i) => {
+      const b = document.createElement('button'); b.className = 'ov'; b.type = 'button'; b.setAttribute('aria-label', 'Use example ' + (i + 1));
+      place(b, 64 + 76 * i, 554, 64, 64); b.onclick = () => setCur(sl); $('wrap').appendChild(b); return b;
+    });
+    function sync() { bRun.disabled = !cur || busy; bClr.hidden = !cur || busy; bPick.disabled = busy; exb.forEach(b => b.disabled = busy) }
+    function setCur(sl) { if (busy) return; cur = sl; if (sl) sl.unsafe = null; J = null; sync() }
+    function loadFile(f) {
+      if (busy || !f || !/^image\//.test(f.type)) return;
+      const im = new Image(); im.onload = () => { const sl = newSlot({ file: f }); paint(sl, im); setCur(sl) }; im.src = URL.createObjectURL(f);
+    }
+    bPick.onclick = () => fileIn.click();
+    fileIn.onchange = () => { loadFile(fileIn.files[0]); fileIn.value = '' };
+    bClr.onclick = () => { setCur(null) };
+    bRun.onclick = runJob;
+    $('wrap').addEventListener('dragover', e => e.preventDefault());
+    $('wrap').addEventListener('drop', e => { e.preventDefault(); loadFile(e.dataTransfer.files[0]) });
+
+    /* drawing helpers */
+    const SH = new Path2D('M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5z'), CK = new Path2D('m7.5 12.5 3 3 6-6.5');
+    const TR = new Path2D('M4 7h16M9 7V4h6v3M6.5 7l1 13h9l1-13M10 11v6M14 11v6');
+    const UP = new Path2D('M12 16V4m0 0-4 4m4-4 4 4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3'), XX = new Path2D('M6 6l12 12M18 6 6 18'), PL = new Path2D('M8 5v14l11-7z');
+    const ZAP = new Path2D('M13 2L3 14L12 14L11 22L21 10L12 10Z');
+    function ic(x, a, b, z, c, w, k) {
+      x.save(); x.translate(a, b); x.scale(z / 24, z / 24); x.strokeStyle = c; x.fillStyle = c; x.lineWidth = w; x.lineJoin = 'round'; x.lineCap = 'round'; x.setLineDash([]);
+      if (k === 'sh') { x.stroke(SH); x.beginPath(); x.arc(12, 11, 2.5, 0, TAU); x.stroke() }
+      else if (k === 'ok') { x.beginPath(); x.arc(12, 12, 9.5, 0, TAU); x.stroke(); x.stroke(CK) }
+      else if (k === 'tr') x.stroke(TR); else if (k === 'up') x.stroke(UP); else if (k === 'xx') x.stroke(XX); else if (k === 'zap') x.fill(ZAP); else x.fill(PL);
+      x.restore();
+    }
+    function rr(x, a, b, w, h, r) { x.beginPath(); x.moveTo(a + r, b); x.arcTo(a + w, b, a + w, b + h, r); x.arcTo(a + w, b + h, a, b + h, r); x.arcTo(a, b + h, a, b, r); x.arcTo(a, b, a + w, b, r); x.closePath() }
+    function box(x, a, b, w, h, bc) { rr(x, a, b, w, h, RB); x.fillStyle = '#0b0b0b'; x.fill(); x.lineWidth = 1; x.strokeStyle = bc || LN; x.stroke() }
+    function tx(x, s, a, b, f, c, al, bl) { x.font = f; x.fillStyle = c; x.textAlign = al || 'left'; x.textBaseline = bl || 'top'; x.fillText(s, a, b) }
+    function pic(x, c, a, b, w, h, al, bc) {
+      x.save(); x.globalAlpha = al; rr(x, a, b, w, h, RI); x.fillStyle = '#161616'; x.fill(); x.clip(); x.drawImage(c, a, b, w, h); x.restore();
+      if (bc) { x.save(); x.globalAlpha = al; rr(x, a, b, w, h, RI); x.lineWidth = 1; x.strokeStyle = bc; x.stroke(); x.restore() }
+    }
+    function wrapLines(x, s, w) {
+      const o = []; let l = '';
+      for (const wd of String(s).split(/\s+/)) { const n = l ? l + ' ' + wd : wd; if (x.measureText(n).width > w && l) { o.push(l); l = wd } else l = n }
+      if (l) o.push(l); return o;
+    }
+    function fitText(x, s, w, hh) {
+      let fs = 17, L; for (; fs >= 11; fs--) { x.font = F(500, fs); L = wrapLines(x, s, w); if (L.length * fs * 1.45 <= hh) break }
+      fs = Math.max(fs, 11); return { fs, L: L.slice(0, Math.floor(hh / (fs * 1.45))) };
+    }
+    /* pixel decoding: finer pixel grid + sweeping gradient wave */
+    function pix(x, c, a, b, z, u, T) {
+      const N = [6, 9, 14, 22][Math.min(3, Math.floor(u * 4))];
+      sm.width = sm.height = N; sm.getContext('2d').drawImage(c, 0, 0, N, N);
+      x.save(); rr(x, a, b, z, z, RI); x.clip();
+      x.imageSmoothingEnabled = false; x.drawImage(sm, a, b, z, z); x.imageSmoothingEnabled = true;
+      const cs = z / N, f = u * 1.5 - .25, fr = Math.floor(T * 10);
+      for (let r = 0; r < N; r++) for (let q = 0; q < N; q++) {
+        const ph = (r + q) / (2 * N - 2), d = Math.abs(ph - f), g = RC[Math.round(ph * 15)];
+        if (d < .1) { x.fillStyle = g; x.fillRect(a + q * cs, b + r * cs, cs, cs) }
+        else if (hash(r, q, fr) > .94) { x.strokeStyle = g; x.lineWidth = 1.5; x.strokeRect(a + q * cs + .75, b + r * cs + .75, cs - 1.5, cs - 1.5) }
+      }
+      x.restore(); rr(x, a, b, z, z, RI); x.lineWidth = 1; x.strokeStyle = '#fff'; x.stroke();
+    }
+
+    const P = [new Path2D('M380 296H460'), new Path2D('M760 296C800 296 800 195 840 195'), new Path2D('M760 296C800 296 800 365 840 365')];
+
+    function scene(x, T) {
+      const tt = J ? T - J.t0 : 0, te = (J && J.tRes && T >= J.tRes) ? T - J.tRes : -1;
+      const ok = te >= 0 && !!J.res, bad = te >= 0 && !!J.err, ns = ok ? J.res.unsafe : 0, think = !!J && tt >= .9 && te < 0;
+
+      /* flow paths */
+      const on = [!!J, ok && !ns, ok && !!ns], pc = ['#fff', G, RD];
+      P.forEach((p, n) => { x.lineWidth = 2; x.lineCap = 'round'; x.strokeStyle = on[n] ? pc[n] : LN; x.setLineDash([5, 8]); x.lineDashOffset = on[n] ? -(T * 16.25) : 0; x.stroke(p) });
+      x.setLineDash([]);
+
+      /* header pill */
+      x.font = F(700, 26);
+      const hw = 26 + 28 + 14 + x.measureText('OneDecision-VisionGuard-SFT').width + 26;
+      rr(x, 40, 32, hw, 60, RB); x.fillStyle = '#0b0b0b'; x.fill(); x.lineWidth = 1; x.strokeStyle = LN; x.stroke();
+      ic(x, 66, 48, 28, '#fff', 1.8, 'sh'); tx(x, 'OneDecision-VisionGuard-SFT', 108, 62, F(700, 26), '#f2f2f2', 'left', 'middle');
+
+      /* input container */
+      box(x, 40, 120, 340, 320); tx(x, 'Input', 210, 140, F(500, 18), M, 'center');
+      let inA = 1;
+      if (J) {
+        inA = tt < .3 ? 1 : 1 - .75 * cl((tt - .3) / .5);
+        if (te >= 0) { const t2 = te - (J.res ? 2.62 : .6); if (t2 > 0) inA = .25 + .75 * cl(t2 / .5) }
+      }
+      if (cur) pic(x, srcOf(cur), 90, 176, 240, 240, inA);
+      else {
+        rr(x, 90, 176, 240, 240, RI); x.fillStyle = '#101010'; x.fill(); x.setLineDash([6, 6]); x.lineWidth = 1.5; x.strokeStyle = '#3a3a3a'; x.stroke(); x.setLineDash([]);
+        ic(x, 188, 250, 43, M, 1.6, 'up'); tx(x, 'Upload image', 210, 330, F(700, 17), '#cfcfcf', 'center'); tx(x, 'click or drop a file', 210, 354, F(500, 14), M, 'center');
+      }
+
+      /* clear button (left side) */
+      if (cur && !busy) { x.beginPath(); x.arc(68, 142, 14, 0, TAU); x.fillStyle = '#1a1a1a'; x.fill(); x.lineWidth = 1; x.strokeStyle = LN; x.stroke(); ic(x, 61, 135, 14, '#cfcfcf', 2.2, 'xx') }
+
+      /* run button (right side) — lightning / fast-run icon + text */
+      { const can = cur && !busy;
+        const bx = 294, by = 128, bw = 72, bh = 28;
+        rr(x, bx, by, bw, bh, 6); x.fillStyle = can ? '#fff' : '#242424'; x.fill(); x.lineWidth = 1; x.strokeStyle = can ? '#fff' : '#3a3a3a'; x.stroke();
+        ic(x, 301, 135, 14, can ? '#000' : '#555', 2.2, 'zap');
+        tx(x, 'Run', 320, 142, F(700, 13), can ? '#000' : '#555', 'left', 'middle');
+      }
+
+      /* model */
+      box(x, 460, 120, 300, 320);
+      ic(x, 484, 140, 30, '#fff', 1.8, 'sh'); tx(x, 'VisionGuard', 526, 140, F(700, 22), '#f2f2f2'); tx(x, '4B, 9B, 27B parameters, SFT', 526, 167, F(500, 14), M);
+      let lab = 'Waiting', bg = '#1a1a1a', fg = M, runc = false;
+      if (J) {
+        if (ok) { lab = ns ? 'Unsafe' : 'Safe'; bg = ns ? RD : G; fg = ns ? '#2a0409' : '#04170e' }
+        else if (bad) { lab = 'Error'; bg = RD; fg = '#2a0409' }
+        else if (tt < .9) { lab = 'Uploading'; bg = '#fff'; fg = '#000'; runc = true }
+        else { lab = J.q ? 'Queued' : STG[Math.floor((T - J.t0 - .9) / .6) % 4]; bg = '#fff'; fg = '#000'; runc = true }
+      }
+      x.font = F(700, 16); const tw = x.measureText(lab).width, gw = runc ? 29 : 0, cw = tw + 40 + gw, cx0 = 610 - cw / 2;
+      rr(x, cx0, 386, cw, 34, RI); x.fillStyle = bg; x.fill();
+      if (runc) for (let r = 0; r < 3; r++) for (let q = 0; q < 3; q++) { x.fillStyle = `rgba(0,0,0,${(.15 + .85 * hash(r, q, Math.floor(T * 8))).toFixed(2)})`; x.fillRect(cx0 + 20 + q * 7, 395 + r * 7, 5, 5) }
+      tx(x, lab, cx0 + 20 + gw, 403, F(700, 16), fg, 'left', 'middle');
+
+      /* verdict boxes (session history) */
+      [[840, 120, 'Passed', 'safe = 1', G, '#1f6b4b', 'Released downstream', 'ok', 0], [840, 290, 'Dumped', 'unsafe = 1', RD, '#7a2a33', 'Blocked and discarded', 'tr', 1]].forEach(d => {
+        const all = hist.filter(h => h.unsafe === d[8]), top = d[1];
+        box(x, d[0], top, 400, 150, d[5]); ic(x, 864, top + 18, 24, d[4], 2.2, d[7]);
+        x.font = F(700, 20); const w1 = x.measureText(d[2]).width;
+        tx(x, d[2], 898, top + 30, F(700, 20), d[4], 'left', 'middle'); tx(x, d[3], 898 + w1 + 10, top + 30, F(500, 14), M, 'left', 'middle');
+        tx(x, String(all.length), 1216, top + 30, F(700, 20), d[4], 'right', 'middle'); tx(x, d[6], 1216, top + 126, F(500, 15), M, 'right', 'bottom');
+        all.slice(-4).forEach((h, j) => {
+          const age = (J && h === J.entry) ? T - (J.tRes + 2.62) : 9, p = age < .35 ? age / .35 : 1, z = 64 * (.6 + .4 * p), c = 892 + 76 * j;
+          pic(x, srcOf(h.sl, h.unsafe), c - z / 2, top + 98 - z / 2, z, z, p, d[8] ? d[5] : LN);
+        });
+      });
+
+      /* examples (safe only) */
+      box(x, 40, 470, 340, 200); tx(x, 'Examples', 64, 490, F(500, 18), M);
+      EX.forEach((sl, i) => {
+        const a = 64 + 76 * i; pic(x, sl.base, a, 554, 64, 64, 1);
+        rr(x, a + 1, 555, 62, 62, RI - 1); x.lineWidth = 2; x.strokeStyle = cur === sl ? '#fff' : LN; x.stroke();
+      });
+
+      /* model output */
+      box(x, 460, 470, 780, 200); tx(x, 'Model output', 484, 490, F(500, 18), M);
+      x.textBaseline = 'top'; x.textAlign = 'left';
+      if (!J) tx(x, 'Upload an image or pick an example, then press the run icon.', 484, 528, F(500, 16), '#5a5a5a');
+      else if (bad) {
+        x.font = F(500, 16); wrapLines(x, J.err, 720).slice(0, 4).forEach((l, i) => tx(x, l, 484, 528 + i * 24, F(500, 16), RD));
+      } else if (ok) {
+        if (!J.fit) J.fit = fitText(x, J.res.reason, 466, 104);
+        const rows = [['  "is_unsafe": ', String(!!ns), ',', ns ? RD : G], ['  "unsafe": ', String(ns), ',', ns ? RD : G], ['  "safe": ', String(J.res.safe), '', ns ? RD : G]];
+        x.font = MO(16); x.fillStyle = '#cfcfcf'; x.fillText('{', 484, 528);
+        rows.forEach((r, j) => {
+          if (te < .24 * (j + 1)) return; let px = 484;
+          [[r[0], '#cfcfcf'], [r[1], r[3]], [r[2], '#cfcfcf']].forEach(p => { x.fillStyle = p[1]; x.fillText(p[0], px, 552 + j * 24); px += x.measureText(p[0]).width });
+        });
+        if (te >= .72) { x.fillStyle = '#cfcfcf'; x.fillText('}', 484, 624) }
+        if (te >= .72) {
+          x.globalAlpha = cl((te - .72) / .5); tx(x, 'Reasoning', 770, 528, F(500, 14), M);
+          J.fit.L.forEach((l, i) => tx(x, l, 770, 555 + i * J.fit.fs * 1.45, F(500, J.fit.fs), '#e6e6e6')); x.globalAlpha = 1;
+        }
+      } else if (think && J.text) {
+        tx(x, 'Streaming', 770, 528, F(500, 14), M); x.font = MO(13);
+        wrapLines(x, J.text, 466).slice(-5).forEach((l, i) => tx(x, l, 770, 555 + i * 20, MO(13), '#9a9a9a'));
+      }
+
+      /* travelling token */
+      if (J) {
+        let al = Math.min(1, tt / .3), px, py, z;
+        if (tt < .9) { const u = ez(tt / .9); px = 210 + 400 * u; py = 296; z = 240 - 96 * u } else { px = 610; py = 296; z = 144 }
+        if (ok) {
+          const pcnt = hist.filter(h => h.unsafe === ns).length - (J.pushed ? 1 : 0), dx = 892 + 76 * Math.min(pcnt, 3), dy = ns ? 388 : 218;
+          if (te > 1.62) { const u = ez(cl((te - 1.62) / .9)); px = 610 + (dx - 610) * u; py = 296 + (dy - 296) * u; z = 144 - 80 * u }
+          if (te >= 2.62) al *= 1 - cl((te - 2.62) / .4);
+        } else if (bad && te > .6) al *= 1 - cl((te - .6) / .4);
+        if (al > 0) {
+          if (think) { x.save(); x.globalAlpha = al; pix(x, srcOf(J.sl), px - z / 2, py - z / 2, z, (((T - J.t0 - .9) % 2.4) + 2.4) % 2.4 / 2.4, T); x.restore() }
+          else pic(x, srcOf(J.sl), px - z / 2, py - z / 2, z, z, al, LN);
+        }
+      }
+    }
+
+    /* rounded outer frame (transparent corners) + slight zoom */
+    function draw(x, k, T) {
+      x.save(); x.setTransform(1, 0, 0, 1, 0, 0); x.globalAlpha = 1; x.clearRect(0, 0, x.canvas.width, x.canvas.height);
+      x.setTransform(k, 0, 0, k, 0, 0); rr(x, 0, 0, W, H, RB); x.fillStyle = '#000'; x.fill(); x.clip();
+      x.setTransform(k * ZX, 0, 0, k * ZY, k * (W / 2 - CX * ZX), k * (H / 2 - CY * ZY));
+      scene(x, T); x.restore();
+    }
+
+    /* state transitions + render loop */
+    function update(T) {
+      if (!J || !J.tRes || T < J.tRes) return;
+      const te = T - J.tRes;
+      if (J.res && J.sl.unsafe == null) J.sl.unsafe = J.res.unsafe;
+      if (J.res && !J.pushed && te >= 2.62) { J.pushed = true; J.entry = { sl: J.sl, unsafe: J.res.unsafe }; hist.push(J.entry) }
+      if (busy && te >= (J.res ? 3 : 1.5)) { busy = false; sync() }
+    }
+    const cv = $('cv'), cx = cv.getContext('2d');
+    function fit() { const d = Math.min(window.devicePixelRatio || 1, 2), w = $('wrap').clientWidth; cv.width = Math.round(w * d); cv.height = Math.round(w * d * H / W) }
+    new ResizeObserver(fit).observe($('wrap')); fit();
+    (function frame() { const T = now(); update(T); draw(cx, cv.width / W, T); requestAnimationFrame(frame) })();
+  </script>
+</body>
+
+</html>

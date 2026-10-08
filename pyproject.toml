@@ -1,0 +1,29 @@
+[project]
+name = "onedecision-visionguard-demo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Prithiv Sakthi U R", email = "prithivsakthi676@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "accelerate==1.14.0",
+    "av==17.1.0",
+    "gradio==6.29.1",
+    "huggingface-hub>=1.24.0",
+    "kernels>=0.17.2",
+    "peft==0.19.1",
+    "pillow>=12.3.0",
+    "spaces>=0.51.1",
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "transformers==5.18.0",
+]
+
+[project.scripts]
+onedecision-visionguard-demo = "onedecision_visionguard_demo:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"

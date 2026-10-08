@@ -1,4 +1,4 @@
-# **OneDecision-VisionGuard-Demo**
+# **[OneDecision-VisionGuard-Demo](https://huggingface.co/spaces/prithivMLmods/OneDecision-VisionGuard-Demo)**
 
 OneDecision-VisionGuard-Demo is an interactive, visual content-moderation and guardrail workflow powered by the `prithivMLmods/OneDecision-VisionGuard-9B-SFT` vision-language classification model (with architectural compatibility extending across the `4B-SFT` and `27B-SFT` variants). Designed as an end-to-end trust and safety screening system, the platform processes visual media to output binary safety classifications alongside granular natural-language reasoning.
 

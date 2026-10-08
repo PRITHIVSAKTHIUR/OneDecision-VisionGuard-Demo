@@ -4,6 +4,8 @@ OneDecision-VisionGuard-Demo is an interactive, visual content-moderation and gu
 
 The workspace couples a FastAPI-backed Gradio Server engine with a canvas-rendered HTML5 single-page application (SPA). The interface presents a visual pipeline diagram depicting live image ingest, tokenization, model inspection, real-time token streaming, verdict routing (*Passed / safe = 1* versus *Dumped / nsfw = 1*), and contextual session history logging.
 
+<img width="1621" height="882" alt="Screenshot From 2026-10-07 14-19-32" src="https://github.com/user-attachments/assets/5b26eea2-263c-4445-986f-630a334675e3" />
+
 ### **Key Features**
 
 * **Vision-Language Safety Screening:** Evaluates source images with structured instruction prompting (`Classify this image as safe or nsfw.`) to determine compliance and generate chain-of-thought moderation rationale.
